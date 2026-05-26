@@ -1,153 +1,100 @@
-# Vaultwarden MCP Server Development
+# CLAUDE.md
 
-This folder contains documentation for building an MCP (Model Context Protocol) server for Vaultwarden.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Goal
+## What This Is
 
-Create an MCP server that allows Claude (and other AI assistants) to:
-- Authenticate with a self-hosted Vaultwarden instance
-- Create, read, update, delete vault items (ciphers)
-- Manage folders and organizations
-- Perform programmatic vault operations via standard MCP protocol
+An MCP (Model Context Protocol) server that bridges Claude to a self-hosted
+Vaultwarden / Bitwarden instance. It handles OAuth authentication, the full
+Bitwarden key derivation chain, and field-level AES-256-CBC encryption —
+exposing 16 MCP tools covering ciphers, folders, and Bitwarden Send.
 
-## What is Vaultwarden?
-
-Vaultwarden is a Rust-based, self-hosted alternative server for Bitwarden. It is fully compatible with all official Bitwarden clients but runs on your own infrastructure. Key facts:
-
-- **Open source** (AGPL-3.0): https://github.com/dani-garcia/vaultwarden
-- **API-compatible** with official Bitwarden API
-- **Lightweight**: Rust-based, minimal resource usage
-- **Supports** all Bitwarden features: login items, secure notes, cards, identities, folders, organizations
-- **Encryption**: End-to-end encrypted using AES-256-CBC with HMAC-SHA256
-
-## Architecture for MCP Server
-
-The MCP server will act as a bridge between Claude and Vaultwarden:
-
-```
-Claude (via MCP protocol)
-    ↓
-MCP Server (this project)
-    ↓
-Vaultwarden API (REST)
-    ↓
-Self-hosted Vaultwarden Instance
-```
-
-## Implementation Notes
-
-### Authentication Flow
-1. Accept Vaultwarden instance URL + API credentials (client_id, client_secret)
-2. Obtain access token via OAuth 2.0 client_credentials grant
-3. Maintain token and refresh as needed
-4. Include token in Authorization header for API calls
-
-### Encryption Requirement
-**Critical**: Vaultwarden requires all vault item fields to be encrypted before sending to the API.
-
-Format: `2.base64_ciphertext|base64_iv|base64_mac`
-
-Where:
-- `2` = encryption type (AES-256-CBC with HMAC)
-- Ciphertext = AES-256-CBC encrypted data (base64)
-- IV = random 16-byte initialization vector (base64)
-- MAC = HMAC-SHA256 of IV + ciphertext (base64)
-
-**Challenge**: The encryption key is derived from the user's master password, which the MCP server does NOT have access to (and should NOT have for security). 
-
-**Solution**: Two approaches:
-1. **User-provided encryption key** - User derives and provides key separately
-2. **Read-only operations** - MCP server can retrieve and decrypt (user's key cached), but cannot create/modify items requiring new encryption
-3. **Hybrid** - Use Vaultwarden's unencrypted export/import features (if available) for structured operations
-
-### Cipher Types
-- `1` = Login (username, password, URIs)
-- `2` = Secure Note
-- `3` = Card (credit card details)
-- `4` = Identity (personal information)
-
-### API Endpoints
-
-**Authentication:**
-- `POST /identity/connect/token` - Get access token
-
-**Vault Items (Ciphers):**
-- `GET /api/ciphers` - List all ciphers
-- `GET /api/ciphers/{id}` - Get single cipher
-- `POST /api/ciphers` - Create cipher
-- `PUT /api/ciphers/{id}` - Update cipher
-- `DELETE /api/ciphers/{id}` - Delete cipher (soft)
-- `DELETE /api/ciphers/{id}/admin` - Delete cipher (permanent)
-
-**Folders:**
-- `GET /api/folders` - List folders
-- `POST /api/folders` - Create folder
-- `PUT /api/folders/{id}` - Update folder
-- `DELETE /api/folders/{id}` - Delete folder
-
-**Organizations:**
-- `GET /api/organizations` - List organizations
-- `GET /api/organizations/{id}` - Get organization details
-- `POST /api/organizations` - Create organization
-
-## Testing Environment
-
-Point the server at your own Vaultwarden instance for integration testing.
-Set the environment variables from `.env.example` and run:
+## Commands
 
 ```bash
-pytest tests/          # unit tests (no live server needed)
+# Install (editable, with dev deps)
+pip install -e ".[dev]"
+
+# Run all tests
+pytest
+
+# Run a single test file
+pytest tests/test_crypto.py
+
+# Run a single test by name
+pytest tests/test_client.py::TestCipherBuilders::test_build_login_all_fields
+
+# Run the server manually (reads env vars; stdio transport for Claude Code)
+vaultwarden-mcp
+
+# Lint
+ruff check src/ tests/
 ```
 
-For end-to-end testing against a live instance, set all five environment
-variables including `VAULTWARDEN_MASTER_PASSWORD` and run the server manually:
+Tests require no live server — HTTP is mocked via `pytest-httpx`. Integration
+testing against a live instance requires the env vars in `.env.example`.
 
-```bash
-VAULTWARDEN_URL=https://vault.yourdomain.com \
-  VAULTWARDEN_CLIENT_ID=user.YOUR-UUID \
-  VAULTWARDEN_CLIENT_SECRET=your-secret \
-  VAULTWARDEN_EMAIL=you@example.com \
-  VAULTWARDEN_MASTER_PASSWORD=yourpassword \
-  vaultwarden-mcp
+## Architecture
+
+Three modules with a strict dependency order:
+
+```
+server.py  →  client.py  →  crypto.py
+(MCP tools)   (HTTP + keys)  (pure crypto, no I/O)
 ```
 
-## Development Workflow
+**`crypto.py`** — Stateless crypto primitives only. No network, no state.
 
-1. **Phase 1**: Implement basic OAuth authentication
-2. **Phase 2**: Implement GET operations (read-only vault access)
-3. **Phase 3**: Implement encryption and PUT/POST operations (write access)
-4. **Phase 4**: Add MCP protocol wrapper and tools
-5. **Phase 5**: Testing and documentation
+**`client.py`** — `VaultwardenClient` owns the `httpx.AsyncClient` singleton
+(connection pooling), OAuth token cache, and the derived encryption keys. All
+Vaultwarden API calls go through `_get()`, `_post()`, `_put()`, `_delete()`.
 
-## Security Considerations
+**`server.py`** — FastMCP server. The `_lifespan` context manager creates and
+tears down the `VaultwardenClient` singleton stored in `_client`. Tools
+retrieve it via `_get_client()`. Error handling converts exceptions to
+user-facing strings — tools never raise.
 
-- **Never log credentials** in MCP server output
-- **Encrypt keys in transit** (use HTTPS only)
-- **Validate SSL certificates** (no self-signed bypass in production)
-- **Scope API access** - Use minimal required permissions
-- **Handle errors gracefully** - Don't expose sensitive data in error messages
-- **Sanitize user input** - Validate all parameters before API calls
+## Bitwarden Key Chain
 
-## Resources
+This is the most non-obvious part of the codebase. Two distinct levels of keys:
 
-- Vaultwarden GitHub: https://github.com/dani-garcia/vaultwarden
-- Bitwarden Server API docs: See REFERENCES.md
-- Vaultwarden Wiki: https://github.com/dani-garcia/vaultwarden/wiki
-- MCP Protocol docs: https://modelcontextprotocol.io/
+```
+master_password + email
+    │
+    ▼  PBKDF2-SHA256 (600,000 iterations)
+master_key (32 bytes)
+    │
+    ▼  HKDF-Expand × 2 (info=b"enc", info=b"mac")
+stretched_enc (32 bytes) + stretched_mac (32 bytes)
+    │
+    ▼  decrypt Profile.Key from GET /api/sync
+user_enc_key (32 bytes) + user_mac_key (32 bytes)
+    │
+    ▼  used for every cipher field
+EncString: "2.<ct_b64>|<iv_b64>|<mac_b64>"
+```
 
-## Key Files in This Project
+`setup_crypto()` performs this entire chain and stores the final keys in
+`_enc_key` / `_mac_key`. Without it, `has_crypto` is `False` and the server
+runs in read-only mode — cipher names are shown as raw EncStrings.
 
-- `CLAUDE.md` - This file; project guidelines
-- `README.md` - Installation, configuration, and tool reference
-- `pyproject.toml` - Package and dependency definition
-- `.env.example` - Environment variable template (copy to `.env`, never commit `.env`)
-- `src/vaultwarden_mcp/` - MCP server source code
-- `tests/` - Unit tests (pytest + pytest-httpx, no live server required)
+## Cipher Response Convention
 
-## Notes for Next Session
+Vaultwarden API responses use PascalCase keys (`Name`, `Login`, `Password`).
+`_decrypt_cipher()` augments each dict with underscore-prefixed decrypted
+counterparts: `_name`, `_notes`, `_login`, `_card`, `_identity`. Tools always
+read the `_`-prefixed keys for display; raw keys are preserved for re-encrypting
+on update (`patch_cipher_payload()`).
 
-When resuming development:
-1. Run `pytest tests/` to confirm baseline
-2. Check `README.md` for the full tool inventory and configuration reference
-3. Integration tests require a live Vaultwarden instance and env vars from `.env.example`
-4. Credentials must never be committed — use `.env` locally, env vars in CI
+## Two-Mode Operation
+
+| Mode | Condition | Read | Write |
+|------|-----------|------|-------|
+| Read-only | No master password | Names shown as EncStrings | Not available |
+| Read/write | `VAULTWARDEN_MASTER_PASSWORD` + `VAULTWARDEN_EMAIL` set | Fully decrypted | All tools |
+
+## Style
+
+Google Python Style Guide. 80-char line limit. All public and private
+functions/methods carry Google-style docstrings with `Args`, `Returns`, and
+`Raises` sections. Enforced via `ruff` (see `pyproject.toml`).
